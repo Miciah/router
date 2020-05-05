@@ -32,6 +32,9 @@
 {{- $hstsOptionalTokenPattern := `(?:includeSubDomains|preload)` }}
 {{- $hstsPattern := printf `(?:%[1]s[;])*max-age=(?:\d+|"\d+")(?:[;]%[1]s)*`  $hstsOptionalTokenPattern -}}
 
+{{- /* rewrite target pattern: */}}
+{{- $rewritePattern := `(?:/[^ "']*)` -}}
+
 global
   maxconn {{env "ROUTER_MAX_CONNECTIONS" "20000"}}
 {{- $threads := env "ROUTER_THREADS" }}
@@ -427,6 +430,9 @@ backend {{genBackendNamePrefix $cfg.TLSTermination}}:{{$cfgIdx}}
     {{- end }}
 
   timeout check 5000ms
+  {{- with $rewriteTarget := firstMatch $rewritePattern (index $cfg.Annotations "haproxy.router.openshift.io/rewrite-target") }}
+  http-request replace-uri ^{{ $cfg.Path }}(.*)$ {{ $rewriteTarget }}\1
+  {{- end }}
   http-request set-header X-Forwarded-Host %[req.hdr(host)]
   http-request set-header X-Forwarded-Port %[dst_port]
   http-request set-header X-Forwarded-Proto http if !{ ssl_fc }
