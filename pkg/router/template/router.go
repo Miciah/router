@@ -18,6 +18,7 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 	"github.com/prometheus/client_golang/prometheus"
+	"golang.org/x/sys/unix"
 
 	"k8s.io/apimachinery/pkg/util/sets"
 
@@ -43,6 +44,11 @@ const (
 
 	caCertPostfix   = "_ca"
 	destCertPostfix = "_pod"
+
+	// environDir is the path to the subdirectory with environment variables
+	// for configuring the router.  environDir is relative to the working
+	// directory.
+	environDir = "conf/environ"
 
 	// '-' is not used because namespace can contain dashes
 	// '_' is not used as this could be part of the name in the future
@@ -281,6 +287,9 @@ func newTemplateRouter(cfg templateRouterCfg) (*templateRouter, error) {
 	if err := router.watchMutualTLSCert(); err != nil {
 		return nil, err
 	}
+	if err := router.watchEnvironDir(); err != nil {
+		return nil, err
+	}
 	if router.dynamicConfigManager != nil {
 		log.V(0).Info("initializing dynamic config manager ... ")
 		router.dynamicConfigManager.Initialize(router, router.defaultCertificatePath)
@@ -476,6 +485,145 @@ func (r *templateRouter) watchMutualTLSCert() error {
 			log.V(0).Error(err, "failed to establish watch on mTLS certificate directory")
 			return nil
 		}
+	}
+	return nil
+}
+
+// templateOnlyEnvVar is a map of environment variables that are used in the
+// configuration template.  If a variable is in this map, then it is sufficient
+// to reload HAProxy rather than restart openshift-router.
+//
+// This list was generated using the following command:
+//
+//	sed -ne 's/.*env \("[^"]\+"\).*/\t\1: struct{}{},/p' -- ./images/router/haproxy/conf/haproxy-config.template | sort -u
+var templateOnlyEnvVar = map[string]struct{}{
+	"ROUTER_ALLOW_WILDCARD_ROUTES":      struct{}{},
+	"ROUTER_BACKEND_CHECK_INTERVAL":     struct{}{},
+	"ROUTER_BACKEND_PROCESS_ENDPOINTS":  struct{}{},
+	"ROUTER_BUF_SIZE":                   struct{}{},
+	"ROUTER_CIPHERS":                    struct{}{},
+	"ROUTER_CIPHERSUITES":               struct{}{},
+	"ROUTER_CLIENT_FIN_TIMEOUT":         struct{}{},
+	"ROUTER_COMPRESSION_MIME":           struct{}{},
+	"ROUTER_COOKIE_NAME":                struct{}{},
+	"ROUTER_DEFAULT_CLIENT_TIMEOUT":     struct{}{},
+	"ROUTER_DEFAULT_CONNECT_TIMEOUT":    struct{}{},
+	"ROUTER_DEFAULT_SERVER_FIN_TIMEOUT": struct{}{},
+	"ROUTER_DEFAULT_SERVER_TIMEOUT":     struct{}{},
+	"ROUTER_DEFAULT_TUNNEL_TIMEOUT":     struct{}{},
+	"ROUTER_DISABLE_HTTP2":              struct{}{},
+	"ROUTER_DONT_LOG_NULL":              struct{}{},
+	"ROUTER_ENABLE_COMPRESSION":         struct{}{},
+	"ROUTER_ERRORFILE_404":              struct{}{},
+	"ROUTER_ERRORFILE_503":              struct{}{},
+	"ROUTER_HAPROXY_CONTSTATS":          struct{}{},
+	"ROUTER_HARD_STOP_AFTER":            struct{}{},
+	"ROUTER_HTTP_IGNORE_PROBES":         struct{}{},
+	"ROUTER_INSPECT_DELAY":              struct{}{},
+	"ROUTER_IP_V4_V6_MODE":              struct{}{},
+	"ROUTER_LOAD_BALANCE_ALGORITHM":     struct{}{},
+	"ROUTER_LOG_LEVEL":                  struct{}{},
+	"ROUTER_MAX_CONNECTIONS":            struct{}{},
+	"ROUTER_MAX_REWRITE_SIZE":           struct{}{},
+	"ROUTER_MUTUAL_TLS_AUTH_CA":         struct{}{},
+	"ROUTER_MUTUAL_TLS_AUTH_CRL":        struct{}{},
+	"ROUTER_MUTUAL_TLS_AUTH_FILTER":     struct{}{},
+	"ROUTER_MUTUAL_TLS_AUTH":            struct{}{},
+	"ROUTER_SET_FORWARDED_HEADERS":      struct{}{},
+	"ROUTER_SLOWLORIS_HTTP_KEEPALIVE":   struct{}{},
+	"ROUTER_SLOWLORIS_TIMEOUT":          struct{}{},
+	"ROUTER_STRICT_SNI":                 struct{}{},
+	"ROUTER_SYSLOG_ADDRESS":             struct{}{},
+	"ROUTER_SYSLOG_FORMAT":              struct{}{},
+	"ROUTER_THREADS":                    struct{}{},
+	"ROUTER_UNIQUE_ID_FORMAT":           struct{}{},
+	"ROUTER_UNIQUE_ID_HEADER_NAME":      struct{}{},
+	"ROUTER_USE_PROXY_PROTOCOL":         struct{}{},
+	"SSL_MAX_VERSION":                   struct{}{},
+	"SSL_MIN_VERSION":                   struct{}{},
+}
+
+// watchEnvironDir watches the directory containing the router configuration
+// environment variables.  If an environment variable changes, watchEnvironDir
+// updates the process's environment accordingly and re-execs if necessary to
+// effectuate the updated configuration.
+func (r *templateRouter) watchEnvironDir() error {
+	dir := filepath.Join(r.dir, environDir)
+	if _, err := os.Stat(dir); os.IsNotExist(err) {
+		return nil
+	}
+
+	reloadFn := func() {
+		oldEnvMap := map[string]string{}
+		for _, kv := range os.Environ() {
+			k, v, ok := strings.Cut(kv, "=")
+			if !ok {
+				continue
+			}
+			oldEnvMap[k] = v
+		}
+		// newEnvMap := map[string]string{}
+		// for k, v := range oldEnvMap {
+		// 	newEnvMap[k] = v
+		// }
+		files, err := os.ReadDir(dir)
+		if err != nil {
+			log.Error(err, "unable to read updated config")
+			return
+		}
+		needReload := false
+		needRestart := false
+		for _, f := range files {
+			k := f.Name()
+			if k[0] == '.' {
+				// Ignore hidden files, such as "..data".
+				continue
+			}
+			b, err := os.ReadFile(filepath.Join(dir, k))
+			if err != nil {
+				log.Error(err, "unable to read file")
+				return
+			}
+			v := string(b)
+			if oldEnvMap[k] == v {
+				continue
+			}
+			log.V(0).Info("environment variable changed", "key", k, "old value", oldEnvMap[k], "new value", v)
+			// newEnvMap[k] = v
+			if err := os.Setenv(k, v); err != nil {
+				log.Error(err, "failed to set environment variable")
+				return
+			}
+			needReload = true
+			if _, ok := templateOnlyEnvVar[k]; !ok {
+				if !needRestart {
+					log.V(0).Info("restart is required")
+				}
+				needRestart = true
+			}
+		}
+		if needRestart {
+			argv0, err := os.Executable()
+			if err != nil {
+				log.Error(err, "unable to restart openshift-router with updated config")
+				return
+			}
+			// envv := []string{}
+			// for k, v := range newEnvMap {
+			// 	envv = append(envv, fmt.Sprintf("%s=%s", k, v))
+			// }
+			envv := os.Environ()
+			// TODO This probably leaks file descriptors and more.
+			unix.Exec(argv0, os.Args, envv)
+		}
+		if needReload {
+			log.V(0).Info("reloading to get updated router configuration")
+			r.rateLimitedCommitFunction.RegisterChange()
+		}
+	}
+	if err := r.watchVolumeMountDir(dir, reloadFn); err != nil {
+		log.V(0).Error(err, "failed to establish watch on environ directory")
+		return nil
 	}
 	return nil
 }

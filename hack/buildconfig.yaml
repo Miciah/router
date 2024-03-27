@@ -1,0 +1,47 @@
+apiVersion: v1
+kind: Template
+metadata:
+  name: router-build
+  annotations:
+    description: "Template for building the router."
+objects:
+- apiVersion: v1
+  kind: ImageStream
+  metadata:
+    name: origin-haproxy-router
+- apiVersion: v1
+  kind: BuildConfig
+  metadata:
+    labels:
+      build: router
+    name: router
+  spec:
+    output:
+      to:
+        kind: ImageStreamTag
+        name: origin-haproxy-router:latest
+    source:
+      dockerfile: |
+        FROM registry.svc.ci.openshift.org/openshift/release:golang-1.13 AS builder
+        WORKDIR /go/src/github.com/openshift/router
+        COPY . .
+        RUN make
+        FROM openshift/origin-haproxy-router:v4.0
+        COPY --from=builder /go/src/github.com/openshift/router/openshift-router /usr/bin/
+        COPY --from=builder /go/src/github.com/openshift/router/images/router/haproxy/conf/haproxy-config.template /var/lib/haproxy/conf/haproxy-config.template
+        LABEL io.k8s.display-name="OpenShift Router" \
+              io.k8s.description="This is the base image from which all template based routers inherit." \
+              io.openshift.tags="openshift,router"
+      git:
+        uri: ${GIT_URL}
+        ref: ${GIT_BRANCH}
+      type: Git
+    strategy:
+      type: Docker
+parameters:
+- description: 'URL for the OpenShift router Git repository'
+  name: GIT_URL
+  value: https://github.com/openshift/router
+- description: 'Git branch'
+  name: GIT_BRANCH
+  value: master
