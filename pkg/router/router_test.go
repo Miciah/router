@@ -709,7 +709,6 @@ func TestConfigTemplate(t *testing.T) {
 					sectionName: insecureBackendName(h.namespace, "p3"),
 					attribute:   "server",
 					value:       "proto h2",
-					notFound:    true,
 				},
 			},
 		},
